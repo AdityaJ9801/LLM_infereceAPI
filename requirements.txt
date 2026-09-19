@@ -1,0 +1,15 @@
+# Native install on the Linux GPU server (no WSL/Docker needed).
+# (If you're using the Docker path instead, you don't need this file -
+# the vllm/vllm-openai base image already ships vllm/torch/transformers.)
+#
+# NVIDIA B200 (Blackwell, sm_100) needs a recent stack: NVIDIA driver with
+# CUDA 12.6+/12.8 support, and a vllm/torch build with Blackwell kernels.
+# Don't pin an old vllm version here - install the latest release and run
+# the sanity check in README.md before loading a large model.
+vllm>=0.8.0
+fastapi>=0.110
+uvicorn[standard]>=0.27
+transformers>=4.44
+pydantic>=2.0
+python-dotenv>=1.0
+huggingface_hub>=0.23

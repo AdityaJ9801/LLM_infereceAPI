@@ -1,0 +1,29 @@
+# Secrets / local config
+.env
+cloudflared/config.yml
+*.pem
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Logs
+*.log
+server.log
+nohup.out
+
+# Model / HF cache (if ever downloaded into the repo instead of ~/.cache)
+hf-cache/
+.cache/
+
+# cloudflared binary downloaded directly (not the apt/dpkg package)
+cloudflared
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
