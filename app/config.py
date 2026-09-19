@@ -14,18 +14,21 @@ def _opt(name: str) -> Optional[str]:
 
 @dataclass
 class Settings:
-    model_name: str = os.getenv("MODEL_NAME", "Qwen/Qwen3-32B")
+    # Real Hugging Face repo IDs only. Default fits comfortably in ~45GB VRAM
+    # at plain bf16 (no quantization) - see README for the 32B+4bit upgrade path.
+    model_name: str = os.getenv("MODEL_NAME", "Qwen/Qwen3-14B")
     tokenizer_name: Optional[str] = _opt("TOKENIZER_NAME")
-    quantization: Optional[str] = _opt("QUANTIZATION")  # "awq", "gptq", "fp8", or None
-    dtype: str = os.getenv("DTYPE", "auto")
     trust_remote_code: bool = os.getenv("TRUST_REMOTE_CODE", "true").lower() == "true"
     # Qwen3's chat template has a built-in reasoning ("thinking") mode; harmless
     # extra kwarg for chat templates that don't reference it.
     enable_thinking: bool = os.getenv("ENABLE_THINKING", "true").lower() == "true"
 
-    tensor_parallel_size: int = int(os.getenv("TENSOR_PARALLEL_SIZE", "1"))
-    gpu_memory_utilization: float = float(os.getenv("GPU_MEMORY_UTILIZATION", "0.92"))
-    max_model_len: int = int(os.getenv("MAX_MODEL_LEN", "8192"))
+    # "bfloat16", "float16", or "auto" (use the checkpoint's declared dtype).
+    torch_dtype: str = os.getenv("TORCH_DTYPE", "bfloat16")
+    device: str = os.getenv("DEVICE", "cuda:0")
+    # 4-bit (bitsandbytes) quantization - opt-in, needed to fit larger models
+    # (e.g. 32B) in ~45GB. Leave false for the safest/simplest path.
+    load_in_4bit: bool = os.getenv("LOAD_IN_4BIT", "false").lower() == "true"
 
     host: str = os.getenv("HOST", "0.0.0.0")
     port: int = int(os.getenv("PORT", "8000"))

@@ -1,0 +1,9 @@
+# Copy to a real config.yml after running `cloudflared tunnel create llm-api`.
+# Replace <TUNNEL_ID> and the credentials-file path with the values printed by that command.
+tunnel: <TUNNEL_ID>
+credentials-file: C:\Users\<you>\.cloudflared\<TUNNEL_ID>.json
+
+ingress:
+  - hostname: llm.yourdomain.com
+    service: http://localhost:8000
+  - service: http_status:404

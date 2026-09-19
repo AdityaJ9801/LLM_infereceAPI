@@ -19,9 +19,6 @@ nohup.out
 hf-cache/
 .cache/
 
-# cloudflared binary downloaded directly (not the apt/dpkg package)
-cloudflared
-
 # OS / editor cruft
 .DS_Store
 Thumbs.db

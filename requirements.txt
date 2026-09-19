@@ -1,15 +1,22 @@
-# Native install on the Linux GPU server (no WSL/Docker needed).
-# (If you're using the Docker path instead, you don't need this file -
-# the vllm/vllm-openai base image already ships vllm/torch/transformers.)
+# Plain transformers + torch inference (no vLLM) - avoids vLLM's fast-moving
+# compiled-kernel/CUDA-version pinning entirely.
 #
-# NVIDIA B200 (Blackwell, sm_100) needs a recent stack: NVIDIA driver with
-# CUDA 12.6+/12.8 support, and a vllm/torch build with Blackwell kernels.
-# Don't pin an old vllm version here - install the latest release and run
-# the sanity check in README.md before loading a large model.
-vllm>=0.8.0
+# IMPORTANT on very new GPUs (e.g. Blackwell/B200): plain `pip install torch`
+# can still resolve a build newer than your driver supports (same failure
+# mode vLLM hit). Pin the CUDA build explicitly to match `nvidia-smi`'s
+# reported "CUDA Version" - this line targets CUDA 12.8:
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+torch
+transformers>=4.46
+accelerate>=0.34
 fastapi>=0.110
 uvicorn[standard]>=0.27
-transformers>=4.44
 pydantic>=2.0
 python-dotenv>=1.0
 huggingface_hub>=0.23
+
+# Only required if LOAD_IN_4BIT=true in .env (optional - lets a 32B model
+# fit in ~45GB). Comment out if you're not using it and don't want the
+# extra CUDA-kernel-compatibility surface on brand-new hardware.
+bitsandbytes>=0.43

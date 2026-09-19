@@ -1,3 +1,0 @@
-# Extra deps on top of the vllm/vllm-openai base image (already has
-# vllm, torch, transformers, fastapi, uvicorn, pydantic).
-python-dotenv>=1.0
