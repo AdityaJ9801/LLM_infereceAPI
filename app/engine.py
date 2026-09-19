@@ -68,19 +68,24 @@ class LLMEngine:
         self.model.eval()
         logger.info("Model loaded on %s", self.model.device)
 
-    def _build_input_ids(self, messages: List[dict]) -> torch.Tensor:
-        input_ids = self.tokenizer.apply_chat_template(
+    def _build_inputs(self, messages: List[dict]) -> dict:
+        # return_dict=True is explicit on purpose: apply_chat_template's return
+        # type (bare tensor vs BatchEncoding) has varied across transformers
+        # versions, which previously caused generate() to choke on a
+        # BatchEncoding passed where it expected a plain tensor.
+        encoded = self.tokenizer.apply_chat_template(
             messages,
             tokenize=True,
             add_generation_prompt=True,
             return_tensors="pt",
+            return_dict=True,
             enable_thinking=settings.enable_thinking,
         )
-        return input_ids.to(self.model.device)
+        return {k: v.to(self.model.device) for k, v in encoded.items()}
 
-    def _gen_kwargs(self, input_ids, max_new_tokens: int, temperature: float, top_p: float, stop: Optional[List[str]]):
+    def _gen_kwargs(self, inputs: dict, max_new_tokens: int, temperature: float, top_p: float, stop: Optional[List[str]]):
         kwargs = dict(
-            input_ids=input_ids,
+            **inputs,
             max_new_tokens=max_new_tokens,
             do_sample=temperature > 0,
             top_p=top_p,
@@ -109,16 +114,17 @@ class LLMEngine:
             )
 
     def _generate_sync(self, messages, max_new_tokens, temperature, top_p, stop) -> dict:
-        input_ids = self._build_input_ids(messages)
-        gen_kwargs = self._gen_kwargs(input_ids, max_new_tokens, temperature, top_p, stop)
+        inputs = self._build_inputs(messages)
+        prompt_len = inputs["input_ids"].shape[-1]
+        gen_kwargs = self._gen_kwargs(inputs, max_new_tokens, temperature, top_p, stop)
         with torch.no_grad():
             output_ids = self.model.generate(**gen_kwargs)
-        new_tokens = output_ids[0][input_ids.shape[-1] :]
+        new_tokens = output_ids[0][prompt_len:]
         text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
         finish_reason = "length" if len(new_tokens) >= max_new_tokens else "stop"
         return {
             "text": text,
-            "prompt_tokens": input_ids.shape[-1],
+            "prompt_tokens": prompt_len,
             "completion_tokens": len(new_tokens),
             "finish_reason": finish_reason,
         }
@@ -133,9 +139,9 @@ class LLMEngine:
     ) -> AsyncGenerator[str, None]:
         await self._lock.acquire()
         try:
-            input_ids = self._build_input_ids(messages)
+            inputs = self._build_inputs(messages)
             streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True)
-            gen_kwargs = self._gen_kwargs(input_ids, max_new_tokens, temperature, top_p, stop)
+            gen_kwargs = self._gen_kwargs(inputs, max_new_tokens, temperature, top_p, stop)
             gen_kwargs["streamer"] = streamer
 
             thread = threading.Thread(target=self._run_generate, kwargs=gen_kwargs, daemon=True)
