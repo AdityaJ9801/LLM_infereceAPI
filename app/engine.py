@@ -1,7 +1,16 @@
 import asyncio
 import logging
+import os
 import threading
 from typing import AsyncGenerator, List, Optional
+
+# Must be set before `import torch`. On unprivileged containers attached to an
+# NVIDIA MIG slice, NVML device-level queries return NVML_ERROR_NO_PERMISSION,
+# which otherwise crashes torch's CUDA caching allocator with a hard assert
+# ("NVML_SUCCESS == r INTERNAL ASSERT FAILED") on model load. This forces
+# torch to fall back to the standard CUDA Runtime API instead. Harmless on
+# non-MIG GPUs too.
+os.environ.setdefault("PYTORCH_NO_CUDA_NVML", "1")
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
@@ -35,7 +44,7 @@ class LLMEngine:
         logger.info("Loading model %s ...", settings.model_name)
 
         model_kwargs = dict(
-            torch_dtype=_dtype_from_setting(settings.torch_dtype),
+            dtype=_dtype_from_setting(settings.torch_dtype),
             device_map={"": settings.device},
             trust_remote_code=settings.trust_remote_code,
             low_cpu_mem_usage=True,
@@ -49,7 +58,7 @@ class LLMEngine:
                 bnb_4bit_compute_dtype=torch.bfloat16,
                 bnb_4bit_quant_type="nf4",
             )
-            model_kwargs.pop("torch_dtype", None)
+            model_kwargs.pop("dtype", None)
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             settings.tokenizer_name or settings.model_name,
