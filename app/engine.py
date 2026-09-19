@@ -48,6 +48,7 @@ class LLMEngine:
             device_map={"": settings.device},
             trust_remote_code=settings.trust_remote_code,
             low_cpu_mem_usage=True,
+            attn_implementation=settings.attn_implementation,
         )
 
         if settings.load_in_4bit:

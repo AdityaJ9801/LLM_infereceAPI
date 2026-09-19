@@ -29,6 +29,12 @@ class Settings:
     # 4-bit (bitsandbytes) quantization - opt-in, needed to fit larger models
     # (e.g. 32B) in ~45GB. Leave false for the safest/simplest path.
     load_in_4bit: bool = os.getenv("LOAD_IN_4BIT", "false").lower() == "true"
+    # "eager", "sdpa", or "flash_attention_2". Defaults to "eager" because
+    # cuDNN's SDPA backend has known bugs/crashes on Blackwell (B200, sm_100)
+    # as of this writing - "eager" sidesteps the optimized-kernel backends
+    # entirely at the cost of speed. Try "sdpa" once things are stable if you
+    # want the performance back and your stack doesn't hit the same bug.
+    attn_implementation: str = os.getenv("ATTN_IMPLEMENTATION", "eager")
 
     host: str = os.getenv("HOST", "0.0.0.0")
     port: int = int(os.getenv("PORT", "8000"))
