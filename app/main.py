@@ -8,7 +8,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
 
 from app.config import settings
-from app.engine import llm_engine
+from app.engine import ServerBusyError, llm_engine
 from app.schemas import (
     ChatCompletionChoice,
     ChatCompletionRequest,
@@ -26,8 +26,9 @@ logger = logging.getLogger("server")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await llm_engine.load()
+    await llm_engine.startup()
     yield
+    await llm_engine.shutdown()
 
 
 app = FastAPI(title="Local LLM Inference API", lifespan=lifespan)
@@ -50,7 +51,7 @@ def _stop_list(stop) -> Optional[List[str]]:
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model": settings.model_name}
+    return {"status": "ok", "model": settings.model_name, **llm_engine.status()}
 
 
 @app.get("/v1/models")
@@ -65,13 +66,21 @@ async def chat_completions(req: ChatCompletionRequest, _: None = Depends(check_a
     stop = _stop_list(req.stop)
     model_name = req.model or settings.model_name
 
+    try:
+        llm_engine.check_admission()
+    except ServerBusyError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
     if req.stream:
         return StreamingResponse(
             _stream_generator(messages, max_new_tokens, req.temperature, req.top_p, stop, model_name),
             media_type="text/event-stream",
         )
 
-    result = await llm_engine.generate(messages, max_new_tokens, req.temperature, req.top_p, stop)
+    try:
+        result = await llm_engine.generate(messages, max_new_tokens, req.temperature, req.top_p, stop)
+    except ServerBusyError as e:
+        raise HTTPException(status_code=503, detail=str(e))
 
     return ChatCompletionResponse(
         model=model_name,

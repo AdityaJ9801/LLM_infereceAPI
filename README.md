@@ -10,9 +10,14 @@ newer than the installed driver supports. Plain `transformers` has a much
 simpler, more predictable dependency chain.
 
 **Important tradeoff:** plain `transformers.generate()` has no continuous
-batching like vLLM does. This server serializes requests with a lock — one
-generation runs on the GPU at a time. Fine for a single user or light use;
-concurrent throughput will be much lower than a vLLM-based setup.
+batching like vLLM does. This server instead runs up to `MAX_CONCURRENT_REQUESTS`
+generations at once (each holding its own KV cache in VRAM), queues anything
+beyond that (up to `MAX_QUEUE_SIZE`, then rejects with HTTP 503), and can
+unload the model from VRAM entirely after `IDLE_UNLOAD_SECONDS` of no
+activity, reloading it transparently on the next request. See "Concurrency,
+queueing, and idle VRAM release" below. Even with concurrency > 1, per-request
+throughput is well below a vLLM-based setup — there's no batched matmul
+across requests, just independent GPU calls interleaved.
 
 **Target hardware assumed below: a single NVIDIA B200 (Blackwell) with ~45GB of
 usable VRAM** (a partition/slice of the full card, which has 180-192GB total).
@@ -55,6 +60,32 @@ python3 -c "import torch; print(torch.__version__, torch.version.cuda, torch.cud
 by `nvidia-smi` (e.g. driver reporting `12.8` cannot run a `cu130`-built torch —
 that's the "driver is too old" error, even though it's really a torch-too-new
 problem). If it errors, fix the install (see below) before going further.
+
+## Concurrency, queueing, and idle VRAM release
+
+Three `.env` settings control how the server shares the GPU:
+
+- **`MAX_CONCURRENT_REQUESTS`** (default `2`) — how many `generate()` calls run
+  on the GPU at once. Each one holds its own KV cache in VRAM for the
+  duration of that request, on top of the model weights, so raise this only
+  as far as your free VRAM allows. With the default `Qwen/Qwen3-14B` at bf16
+  (~28GB weights, ~17GB free on a 45GB card), 2 is a conservative starting
+  point — watch `nvidia-smi` under load before raising it.
+- **`MAX_QUEUE_SIZE`** (default `20`) — requests beyond the concurrency limit
+  wait here. Once the queue itself is full, new requests get an immediate
+  HTTP 503 instead of queueing indefinitely.
+- **`IDLE_UNLOAD_SECONDS`** (default `600`) — if no request has run for this
+  long, a background task frees the model from VRAM (`del` + `torch.cuda.empty_cache()`),
+  so it stops holding memory other processes on a shared server might need.
+  The next request after that transparently reloads it first — that one
+  request pays the full model-load latency again. Set to `0` to disable.
+
+`GET /health` reports live state: `model_loaded`, `active_requests`,
+`queued_requests`, so you can watch this behavior in practice:
+
+```bash
+curl http://localhost:8001/health
+```
 
 ## Project layout
 
@@ -253,6 +284,7 @@ sudo systemctl enable --now cloudflared
   front of the tunnel hostname, requiring login (Google/GitHub/OTP) before
   traffic even reaches your API — a second layer beyond the API key.
 - Consider a Cloudflare rate-limiting rule on the hostname to cap requests/min
-  — GPU inference is expensive to let strangers hammer, and remember this
-  server processes one request at a time (no batching), so concurrent
-  requests just queue up behind each other.
+  — GPU inference is expensive to let strangers hammer, and this server only
+  runs `MAX_CONCURRENT_REQUESTS` generations at once; beyond `MAX_QUEUE_SIZE`
+  queued on top of that, requests get HTTP 503 (see "Concurrency, queueing,
+  and idle VRAM release" above).

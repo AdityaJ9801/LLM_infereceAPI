@@ -36,6 +36,18 @@ class Settings:
     # want the performance back and your stack doesn't hit the same bug.
     attn_implementation: str = os.getenv("ATTN_IMPLEMENTATION", "eager")
 
+    # Bounded concurrency: at most this many generate() calls run on the GPU
+    # at once (each holds its own KV cache in VRAM). Extra requests wait in a
+    # queue up to max_queue_size before getting a 503.
+    max_concurrent_requests: int = int(os.getenv("MAX_CONCURRENT_REQUESTS", "2"))
+    max_queue_size: int = int(os.getenv("MAX_QUEUE_SIZE", "20"))
+
+    # If no requests are active for this many seconds, unload the model from
+    # VRAM (freeing it for other processes on a shared server); it's
+    # transparently reloaded on the next request. 0 disables idle unload.
+    idle_unload_seconds: int = int(os.getenv("IDLE_UNLOAD_SECONDS", "600"))
+    idle_check_interval_seconds: int = int(os.getenv("IDLE_CHECK_INTERVAL_SECONDS", "60"))
+
     host: str = os.getenv("HOST", "0.0.0.0")
     port: int = int(os.getenv("PORT", "8000"))
 

@@ -1,7 +1,10 @@
 import asyncio
+import gc
 import logging
 import os
 import threading
+import time
+from contextlib import asynccontextmanager
 from typing import AsyncGenerator, List, Optional
 
 # Must be set before `import torch`. On unprivileged containers attached to an
@@ -25,6 +28,10 @@ logger = logging.getLogger("engine")
 _DONE = object()
 
 
+class ServerBusyError(Exception):
+    """Raised when the request queue is already at capacity."""
+
+
 def _dtype_from_setting(name: str):
     if name == "auto":
         return "auto"
@@ -32,15 +39,69 @@ def _dtype_from_setting(name: str):
 
 
 class LLMEngine:
-    """Plain transformers.generate() wrapper - single model instance, requests
-    are serialized (no continuous batching like vLLM has)."""
+    """transformers.generate() wrapper with bounded concurrency, a request
+    queue, and idle VRAM release.
+
+    - Up to `max_concurrent_requests` generations run on the GPU at once
+      (each with its own KV cache); beyond that, requests wait on a
+      semaphore. Beyond `max_queue_size` waiting, new requests are rejected
+      with ServerBusyError instead of queueing indefinitely.
+    - If nothing runs for `idle_unload_seconds`, a background task frees the
+      model from VRAM; the next request transparently reloads it.
+
+    Race to guard against: the idle-unloader must never free the model while
+    a request is using it, or in the small window where a request has
+    decided the model is loaded but hasn't started using it yet. Both the
+    "start using the model" step and "unload the model" step take
+    `_load_lock` and check/mutate `_active` inside it, so they can't
+    interleave - a request either fully wins the race (model is confirmed
+    loaded and `_active` is incremented before anything can unload it) or
+    fully loses it (waits for the unload to finish, then reloads).
+    """
 
     def __init__(self) -> None:
         self.model = None
         self.tokenizer = None
-        self._lock = asyncio.Lock()
+        self._load_lock = asyncio.Lock()
+        self._semaphore = asyncio.Semaphore(settings.max_concurrent_requests)
+        self._active = 0
+        self._queue_waiting = 0
+        self._last_used = time.monotonic()
+        self._idle_task: Optional[asyncio.Task] = None
 
-    async def load(self) -> None:
+    async def startup(self) -> None:
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            settings.tokenizer_name or settings.model_name,
+            trust_remote_code=settings.trust_remote_code,
+        )
+        await self._load_model()
+        if settings.idle_unload_seconds > 0:
+            self._idle_task = asyncio.create_task(self._idle_watcher())
+
+    async def shutdown(self) -> None:
+        if self._idle_task is not None:
+            self._idle_task.cancel()
+
+    def status(self) -> dict:
+        return {
+            "model_loaded": self.model is not None,
+            "active_requests": self._active,
+            "queued_requests": self._queue_waiting,
+        }
+
+    def check_admission(self) -> None:
+        """Cheap synchronous pre-check, called before committing to a
+        StreamingResponse - once a stream starts, the 200 status is already
+        sent, so a ServerBusyError raised later inside generate_stream()
+        can't be turned into a clean 503 anymore. _slot() re-checks this
+        properly for the non-streaming path; this is a best-effort early
+        rejection for both paths (small race, acceptable for a soft limit)."""
+        if self._queue_waiting >= settings.max_queue_size:
+            raise ServerBusyError(
+                f"Server busy: {settings.max_queue_size} requests already queued, try again shortly"
+            )
+
+    async def _load_model(self) -> None:
         logger.info("Loading model %s ...", settings.model_name)
 
         model_kwargs = dict(
@@ -61,13 +122,55 @@ class LLMEngine:
             )
             model_kwargs.pop("dtype", None)
 
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            settings.tokenizer_name or settings.model_name,
-            trust_remote_code=settings.trust_remote_code,
+        model = await asyncio.to_thread(
+            AutoModelForCausalLM.from_pretrained, settings.model_name, **model_kwargs
         )
-        self.model = AutoModelForCausalLM.from_pretrained(settings.model_name, **model_kwargs)
-        self.model.eval()
+        model.eval()
+        self.model = model
+        self._last_used = time.monotonic()
         logger.info("Model loaded on %s", self.model.device)
+
+    async def _unload_model(self) -> None:
+        async with self._load_lock:
+            if self._active > 0 or self.model is None:
+                return
+            idle_for = time.monotonic() - self._last_used
+            logger.info("Unloading model from VRAM (idle for %.0fs)", idle_for)
+            del self.model
+            self.model = None
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    async def _idle_watcher(self) -> None:
+        while True:
+            await asyncio.sleep(settings.idle_check_interval_seconds)
+            if self.model is None or self._active > 0:
+                continue
+            if time.monotonic() - self._last_used >= settings.idle_unload_seconds:
+                await self._unload_model()
+
+    @asynccontextmanager
+    async def _slot(self):
+        if self._queue_waiting >= settings.max_queue_size:
+            raise ServerBusyError(
+                f"Server busy: {settings.max_queue_size} requests already queued, try again shortly"
+            )
+        self._queue_waiting += 1
+        try:
+            await self._semaphore.acquire()
+        finally:
+            self._queue_waiting -= 1
+
+        async with self._load_lock:
+            if self.model is None:
+                await self._load_model()
+            self._active += 1
+        try:
+            yield
+        finally:
+            self._active -= 1
+            self._last_used = time.monotonic()
+            self._semaphore.release()
 
     def _build_inputs(self, messages: List[dict]) -> dict:
         # return_dict=True is explicit on purpose: apply_chat_template's return
@@ -109,7 +212,7 @@ class LLMEngine:
         top_p: float,
         stop: Optional[List[str]] = None,
     ) -> dict:
-        async with self._lock:
+        async with self._slot():
             return await asyncio.to_thread(
                 self._generate_sync, messages, max_new_tokens, temperature, top_p, stop
             )
@@ -138,8 +241,7 @@ class LLMEngine:
         top_p: float,
         stop: Optional[List[str]] = None,
     ) -> AsyncGenerator[str, None]:
-        await self._lock.acquire()
-        try:
+        async with self._slot():
             inputs = self._build_inputs(messages)
             streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True)
             gen_kwargs = self._gen_kwargs(inputs, max_new_tokens, temperature, top_p, stop)
@@ -156,8 +258,6 @@ class LLMEngine:
                 yield chunk
 
             await loop.run_in_executor(None, thread.join)
-        finally:
-            self._lock.release()
 
     def _run_generate(self, **kwargs) -> None:
         with torch.no_grad():
