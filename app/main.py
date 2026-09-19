@@ -75,6 +75,14 @@ async def chat_completions(req: ChatCompletionRequest, _: None = Depends(check_a
         return StreamingResponse(
             _stream_generator(messages, max_new_tokens, req.temperature, req.top_p, stop, model_name),
             media_type="text/event-stream",
+            headers={
+                # Without these, intermediate proxies (and some browser/HTTP
+                # clients) buffer the whole response before delivering any of
+                # it, defeating the point of streaming.
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                "Connection": "keep-alive",
+            },
         )
 
     try:
