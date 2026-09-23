@@ -48,6 +48,22 @@ def _dtype_from_setting(name: str):
     return getattr(torch, name)
 
 
+# On unprivileged MIG containers, PyTorch's allocator can also hit the NVML
+# permission wall (see PYTORCH_NO_CUDA_NVML above) specifically while trying
+# to gather diagnostics for an out-of-memory condition - so a real OOM can
+# surface as this cryptic assertion instead of torch.cuda.OutOfMemoryError.
+# Treat both as the same condition rather than letting this one fall through
+# as an unhandled 500.
+_OOM_LIKE_MARKERS = ("out of memory", "NVML_SUCCESS", "CUDACachingAllocator")
+
+
+def _is_oom_like(exc: BaseException) -> bool:
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    msg = str(exc)
+    return any(marker in msg for marker in _OOM_LIKE_MARKERS)
+
+
 # Qwen3's chat template instructs the model to emit tool calls as:
 #   <tool_call>
 #   {"name": "...", "arguments": {...}}
@@ -284,7 +300,9 @@ class LLMEngine:
         try:
             with torch.no_grad():
                 output_ids = self.model.generate(**gen_kwargs)
-        except torch.cuda.OutOfMemoryError:
+        except RuntimeError as e:
+            if not _is_oom_like(e):
+                raise
             torch.cuda.empty_cache()
             raise GPUOutOfMemoryError(
                 "GPU ran out of memory for this request. Lower MAX_CONCURRENT_REQUESTS, "
@@ -357,7 +375,10 @@ class LLMEngine:
         try:
             with torch.no_grad():
                 self.model.generate(**kwargs)
-        except torch.cuda.OutOfMemoryError:
+        except RuntimeError as e:
+            if not _is_oom_like(e):
+                errors.append(e)
+                return
             torch.cuda.empty_cache()
             errors.append(GPUOutOfMemoryError(
                 "GPU ran out of memory for this request. Lower MAX_CONCURRENT_REQUESTS, "

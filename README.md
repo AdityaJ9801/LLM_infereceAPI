@@ -416,6 +416,7 @@ unit for the Python app would make both persist across reboots.)
 | Public URL returns "Invalid or missing API key" even with the right key | `.env`'s `API_KEY` changed after the server last started | Restart the API server — env vars are read once at startup, not hot-reloaded |
 | `curl` right after a restart returns nothing / 502 briefly | Model is still loading (lifespan startup isn't done) | Wait for `Application startup complete` in `server.log` before testing |
 | Cloudflare error 524 ("A Timeout Occurred") | Non-streaming generation took longer than Cloudflare's ~100s proxy timeout (Free/Pro plans, not configurable there) - plausible with `attn_implementation=eager` and a large `max_tokens` | Use `"stream": true` (sends data continuously, avoids the timeout) instead of relying on the fix being on Cloudflare's end; lower `max_tokens` for any non-streaming calls |
+| HTTP 500 with `RuntimeError: NVML_SUCCESS == r INTERNAL ASSERT FAILED` in `server.log`, deep inside `attention_forward`/`torch.matmul` | A real GPU out-of-memory, masked by the same MIG/NVML permission issue as the earlier load crash - this time it's the allocator's OOM-diagnostics path hitting it, not the init path, so `PYTORCH_NO_CUDA_NVML=1` alone doesn't prevent it | Already handled server-side (returns a clean 503 instead of this raw 500) - if you still see the raw traceback, `git pull` to get the fix. Then treat it as an OOM: lower `MAX_CONCURRENT_REQUESTS`, or the prompt (tool schemas count as real tokens) was too large for current headroom |
 
 ### Harden it before leaving it running
 
@@ -438,7 +439,16 @@ cd ~/LLM_infereceAPI
 nohup python3 -m app.main > server.log 2>&1 &
 disown
 tail -f server.log   # wait for "Application startup complete" — don't Ctrl+C early this time
-```
+```What's the new model name (exactly as your endpoint expects it in the 'model` field)?
+
+Same endpoint, different model
+Still https://llm.smigan.com/v1, just swap LLM_MODEL_NAME to a new value you'll give me.
+
+Different endpoint entirely
+New base URL and/or API key too, not just the model name.
+
+Other
+
 
 **Public URL:**
 ```
