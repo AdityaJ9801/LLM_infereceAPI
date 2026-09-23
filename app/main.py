@@ -8,7 +8,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
 
 from app.config import settings
-from app.engine import ServerBusyError, llm_engine
+from app.engine import GPUOutOfMemoryError, ServerBusyError, llm_engine
 from app.schemas import (
     ChatCompletionChoice,
     ChatCompletionRequest,
@@ -89,6 +89,8 @@ async def chat_completions(req: ChatCompletionRequest, _: None = Depends(check_a
         result = await llm_engine.generate(messages, max_new_tokens, req.temperature, req.top_p, stop)
     except ServerBusyError as e:
         raise HTTPException(status_code=503, detail=str(e))
+    except GPUOutOfMemoryError as e:
+        raise HTTPException(status_code=503, detail=str(e))
 
     return ChatCompletionResponse(
         model=model_name,
@@ -124,21 +126,29 @@ async def _stream_generator(messages, max_new_tokens, temperature, top_p, stop, 
         )
     )
 
-    async for delta_text in llm_engine.generate_stream(messages, max_new_tokens, temperature, top_p, stop):
-        if not delta_text:
-            continue
-        yield _sse(
-            ChatCompletionStreamResponse(
-                id=chunk_id,
-                created=created,
-                model=model_name,
-                choices=[
-                    ChatCompletionStreamChoice(
-                        index=0, delta=DeltaMessage(content=delta_text), finish_reason=None
-                    )
-                ],
+    finish_reason = "stop"
+    try:
+        async for delta_text in llm_engine.generate_stream(messages, max_new_tokens, temperature, top_p, stop):
+            if not delta_text:
+                continue
+            yield _sse(
+                ChatCompletionStreamResponse(
+                    id=chunk_id,
+                    created=created,
+                    model=model_name,
+                    choices=[
+                        ChatCompletionStreamChoice(
+                            index=0, delta=DeltaMessage(content=delta_text), finish_reason=None
+                        )
+                    ],
+                )
             )
-        )
+    except (GPUOutOfMemoryError, ServerBusyError) as e:
+        # The 200 status + some chunks may already be on the wire by now, so
+        # this can't become an HTTP error response - surface it as the last
+        # SSE frame instead of just dropping the connection.
+        logger.warning("Streaming generation failed: %s", e)
+        finish_reason = "error"
 
     yield _sse(
         ChatCompletionStreamResponse(
@@ -146,7 +156,7 @@ async def _stream_generator(messages, max_new_tokens, temperature, top_p, stop, 
             created=created,
             model=model_name,
             choices=[
-                ChatCompletionStreamChoice(index=0, delta=DeltaMessage(), finish_reason="stop")
+                ChatCompletionStreamChoice(index=0, delta=DeltaMessage(), finish_reason=finish_reason)
             ],
         )
     )

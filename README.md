@@ -87,6 +87,33 @@ Three `.env` settings control how the server shares the GPU:
 curl http://localhost:8001/health
 ```
 
+If a generation hits a CUDA out-of-memory error (e.g. while you're pushing
+`MAX_CONCURRENT_REQUESTS` up to find the ceiling), the server clears the
+allocator and returns a clean HTTP 503 for that one request instead of
+crashing or leaving the process in a bad state - safe to test against.
+
+### Finding the highest safe `MAX_CONCURRENT_REQUESTS`
+
+There's no formula for this - it depends on your model's per-token KV-cache
+size, `attn_implementation`'s memory overhead during prefill (`eager` uses
+more than `sdpa`/`flash_attention_2`), and your actual prompt/response
+lengths. Use `load_test.py` to find it empirically:
+
+```bash
+# terminal 1: watch GPU memory live
+watch -n 1 nvidia-smi
+
+# terminal 2: fire N concurrent requests, representative of real usage
+python load_test.py --concurrency 4 --max-tokens 1024 --prompt "<something close to your real prompts>"
+```
+
+Raise `--concurrency` (and `MAX_CONCURRENT_REQUESTS` in `.env`, restarting
+the server each time) step by step, watching the peak memory line in
+terminal 1. Stop raising it once peak usage gets within a few GB of your
+GPU's total - leave headroom, since real traffic will vary in prompt/response
+length more than a fixed test prompt does, and CUDA context/fragmentation
+overhead eats a bit more on top of what a clean calculation predicts.
+
 ## Project layout
 
 ```

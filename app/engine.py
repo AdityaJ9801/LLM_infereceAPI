@@ -2,6 +2,7 @@ import asyncio
 import gc
 import logging
 import os
+import queue
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -30,6 +31,12 @@ _DONE = object()
 
 class ServerBusyError(Exception):
     """Raised when the request queue is already at capacity."""
+
+
+class GPUOutOfMemoryError(Exception):
+    """Raised when a generation hits a CUDA OOM - e.g. while probing how high
+    MAX_CONCURRENT_REQUESTS can go. Recoverable: the allocator is cleared
+    before this is raised, so subsequent requests aren't affected."""
 
 
 def _dtype_from_setting(name: str):
@@ -221,8 +228,15 @@ class LLMEngine:
         inputs = self._build_inputs(messages)
         prompt_len = inputs["input_ids"].shape[-1]
         gen_kwargs = self._gen_kwargs(inputs, max_new_tokens, temperature, top_p, stop)
-        with torch.no_grad():
-            output_ids = self.model.generate(**gen_kwargs)
+        try:
+            with torch.no_grad():
+                output_ids = self.model.generate(**gen_kwargs)
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            raise GPUOutOfMemoryError(
+                "GPU ran out of memory for this request. Lower MAX_CONCURRENT_REQUESTS, "
+                "or retry with a shorter prompt/max_tokens."
+            )
         new_tokens = output_ids[0][prompt_len:]
         text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
         finish_reason = "length" if len(new_tokens) >= max_new_tokens else "stop"
@@ -243,32 +257,58 @@ class LLMEngine:
     ) -> AsyncGenerator[str, None]:
         async with self._slot():
             inputs = self._build_inputs(messages)
-            streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True)
+            # timeout=... lets the consumer loop notice a dead generation
+            # thread (e.g. after a CUDA OOM) instead of blocking forever on a
+            # streamer that will never receive its "done" signal.
+            streamer = TextIteratorStreamer(
+                self.tokenizer, skip_prompt=True, skip_special_tokens=True, timeout=10.0
+            )
             gen_kwargs = self._gen_kwargs(inputs, max_new_tokens, temperature, top_p, stop)
             gen_kwargs["streamer"] = streamer
 
-            thread = threading.Thread(target=self._run_generate, kwargs=gen_kwargs, daemon=True)
+            errors: list = []
+            thread = threading.Thread(target=self._run_generate, args=(errors,), kwargs=gen_kwargs, daemon=True)
             thread.start()
 
             loop = asyncio.get_event_loop()
             while True:
-                chunk = await loop.run_in_executor(None, _next_or_done, streamer)
+                chunk = await loop.run_in_executor(None, _next_chunk, streamer)
                 if chunk is _DONE:
                     break
+                if chunk is _EMPTY:
+                    if not thread.is_alive():
+                        break
+                    continue
                 yield chunk
 
             await loop.run_in_executor(None, thread.join)
+            if errors:
+                raise errors[0]
 
-    def _run_generate(self, **kwargs) -> None:
-        with torch.no_grad():
-            self.model.generate(**kwargs)
+    def _run_generate(self, errors: list, **kwargs) -> None:
+        try:
+            with torch.no_grad():
+                self.model.generate(**kwargs)
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            errors.append(GPUOutOfMemoryError(
+                "GPU ran out of memory for this request. Lower MAX_CONCURRENT_REQUESTS, "
+                "or retry with a shorter prompt/max_tokens."
+            ))
+        except Exception as e:  # noqa: BLE001 - surfaced to the caller via `errors`
+            errors.append(e)
 
 
-def _next_or_done(streamer: TextIteratorStreamer):
+_EMPTY = object()
+
+
+def _next_chunk(streamer: TextIteratorStreamer):
     try:
         return next(streamer)
     except StopIteration:
         return _DONE
+    except queue.Empty:
+        return _EMPTY
 
 
 llm_engine = LLMEngine()
