@@ -206,6 +206,60 @@ With `ENABLE_THINKING=true` (Qwen3's default), responses may include a
 `<think>...</think>` reasoning trace before the final answer — that's
 expected, not a bug; strip it client-side if you only want the final answer.
 
+## Tool / function calling
+
+Supported for agent frameworks (LangChain, CrewAI, AutoGen, etc.) that need
+the model to invoke tools. Pass OpenAI-style `tools` in the request:
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <API_KEY>" \
+  -d '{
+    "messages": [{"role": "user", "content": "What is the weather in Paris?"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a location",
+        "parameters": {
+          "type": "object",
+          "properties": {"location": {"type": "string"}},
+          "required": ["location"]
+        }
+      }
+    }]
+  }'
+```
+
+If the model decides to call it, the response looks like the standard OpenAI
+tool-call shape: `finish_reason: "tool_calls"` and
+`choices[0].message.tool_calls[0].function` with `name` and a JSON-encoded
+`arguments` string. Feed the tool's result back as a `{"role": "tool",
+"content": "<result>"}` message (alongside the assistant's `tool_calls` in
+history) in your next request to continue the conversation.
+
+**Known limitations, being upfront about them:**
+
+- **`tool_choice` is accepted but not enforced.** There's no schema field
+  validation forcing the model to call a specific tool, call any tool, or
+  call none - the model decides based on the prompt, same as `"auto"`
+  behavior, regardless of what you pass. Real enforcement needs
+  constrained/grammar-guided decoding, which isn't implemented here.
+- **Tool calls aren't token-streamed**, even with `"stream": true`. A
+  `<tool_call>` block has to be fully generated before it can be parsed into
+  structured `tool_calls`, so a streaming request that results in a tool call
+  buffers the whole generation server-side and delivers it as a single SSE
+  chunk instead of incremental deltas. Plain text responses still stream
+  normally, token by token.
+- **The parsing format is specific to `Qwen/Qwen3-14B`'s chat template**
+  (Hermes-style `<tool_call>{"name":...,"arguments":{...}}</tool_call>`,
+  verified against its actual `tokenizer_config.json`). Some other Qwen3.x
+  models (e.g. Qwen3.5) use a different XML `<function=name>` format instead
+  - if you change `MODEL_NAME` to one of those, `_parse_tool_calls` in
+  `app/engine.py` needs updating to match, or tool calls will silently show
+  up as plain text instead of structured `tool_calls`.
+
 ## 4. Expose it publicly with Cloudflare Tunnel
 
 Cloudflare Tunnel creates an outbound-only connection from your server to

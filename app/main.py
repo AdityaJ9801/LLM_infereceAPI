@@ -61,10 +61,14 @@ async def list_models(_: None = Depends(check_api_key)):
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, _: None = Depends(check_api_key)):
-    messages = [m.model_dump() for m in req.messages]
+    # exclude_none: tool_calls/tool_call_id are absent on most messages, and
+    # the chat template shouldn't see explicit nulls for fields it doesn't
+    # expect on a given role.
+    messages = [m.model_dump(exclude_none=True) for m in req.messages]
     max_new_tokens = req.max_tokens or settings.default_max_tokens
     stop = _stop_list(req.stop)
     model_name = req.model or settings.model_name
+    tools = [t.model_dump() for t in req.tools] if req.tools else None
 
     try:
         llm_engine.check_admission()
@@ -73,7 +77,7 @@ async def chat_completions(req: ChatCompletionRequest, _: None = Depends(check_a
 
     if req.stream:
         return StreamingResponse(
-            _stream_generator(messages, max_new_tokens, req.temperature, req.top_p, stop, model_name),
+            _stream_generator(messages, max_new_tokens, req.temperature, req.top_p, stop, model_name, tools),
             media_type="text/event-stream",
             headers={
                 # Without these, intermediate proxies (and some browser/HTTP
@@ -86,7 +90,7 @@ async def chat_completions(req: ChatCompletionRequest, _: None = Depends(check_a
         )
 
     try:
-        result = await llm_engine.generate(messages, max_new_tokens, req.temperature, req.top_p, stop)
+        result = await llm_engine.generate(messages, max_new_tokens, req.temperature, req.top_p, stop, tools)
     except ServerBusyError as e:
         raise HTTPException(status_code=503, detail=str(e))
     except GPUOutOfMemoryError as e:
@@ -97,7 +101,11 @@ async def chat_completions(req: ChatCompletionRequest, _: None = Depends(check_a
         choices=[
             ChatCompletionChoice(
                 index=0,
-                message=ChatMessage(role="assistant", content=result["text"]),
+                message=ChatMessage(
+                    role="assistant",
+                    content=result["text"] or None,
+                    tool_calls=result["tool_calls"],
+                ),
                 finish_reason=result["finish_reason"],
             )
         ],
@@ -109,7 +117,7 @@ async def chat_completions(req: ChatCompletionRequest, _: None = Depends(check_a
     )
 
 
-async def _stream_generator(messages, max_new_tokens, temperature, top_p, stop, model_name):
+async def _stream_generator(messages, max_new_tokens, temperature, top_p, stop, model_name, tools=None):
     chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
 
@@ -128,21 +136,34 @@ async def _stream_generator(messages, max_new_tokens, temperature, top_p, stop, 
 
     finish_reason = "stop"
     try:
-        async for delta_text in llm_engine.generate_stream(messages, max_new_tokens, temperature, top_p, stop):
-            if not delta_text:
-                continue
-            yield _sse(
-                ChatCompletionStreamResponse(
-                    id=chunk_id,
-                    created=created,
-                    model=model_name,
-                    choices=[
-                        ChatCompletionStreamChoice(
-                            index=0, delta=DeltaMessage(content=delta_text), finish_reason=None
-                        )
-                    ],
+        async for chunk in llm_engine.generate_stream(messages, max_new_tokens, temperature, top_p, stop, tools):
+            if chunk.get("tool_calls"):
+                finish_reason = "tool_calls"
+                yield _sse(
+                    ChatCompletionStreamResponse(
+                        id=chunk_id,
+                        created=created,
+                        model=model_name,
+                        choices=[
+                            ChatCompletionStreamChoice(
+                                index=0, delta=DeltaMessage(tool_calls=chunk["tool_calls"]), finish_reason=None
+                            )
+                        ],
+                    )
                 )
-            )
+            elif chunk.get("content"):
+                yield _sse(
+                    ChatCompletionStreamResponse(
+                        id=chunk_id,
+                        created=created,
+                        model=model_name,
+                        choices=[
+                            ChatCompletionStreamChoice(
+                                index=0, delta=DeltaMessage(content=chunk["content"]), finish_reason=None
+                            )
+                        ],
+                    )
+                )
     except (GPUOutOfMemoryError, ServerBusyError) as e:
         # The 200 status + some chunks may already be on the wire by now, so
         # this can't become an HTTP error response - surface it as the last

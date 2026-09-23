@@ -1,12 +1,15 @@
 import asyncio
 import gc
+import json
 import logging
 import os
 import queue
+import re
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
 # Must be set before `import torch`. On unprivileged containers attached to an
 # NVIDIA MIG slice, NVML device-level queries return NVML_ERROR_NO_PERMISSION,
@@ -43,6 +46,54 @@ def _dtype_from_setting(name: str):
     if name == "auto":
         return "auto"
     return getattr(torch, name)
+
+
+# Qwen3's chat template instructs the model to emit tool calls as:
+#   <tool_call>
+#   {"name": "...", "arguments": {...}}
+#   </tool_call>
+# (verified against Qwen/Qwen3-14B's actual tokenizer_config.json - this is
+# the older Hermes-style JSON format, not the XML <function=...> format some
+# other Qwen3.x models use, so don't copy this regex for a different model
+# without re-checking its chat_template first).
+_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+
+
+def _parse_tool_calls(text: str) -> Tuple[Optional[List[Dict[str, Any]]], str]:
+    """Extract <tool_call> blocks from raw model output. Returns
+    (tool_calls_or_None, remaining_text_with_those_blocks_stripped)."""
+    matches = _TOOL_CALL_RE.findall(text)
+    if not matches:
+        return None, text
+
+    tool_calls = []
+    for raw in matches:
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError:
+            logger.warning("Model emitted a <tool_call> block that isn't valid JSON: %r", raw[:200])
+            continue
+        name = obj.get("name")
+        if not name:
+            continue
+        args = obj.get("arguments", {})
+        # Usually a JSON object per Qwen3's documented format, but defend
+        # against the model emitting an already-JSON-encoded string too
+        # (avoids double-escaping it).
+        args_str = args if isinstance(args, str) else json.dumps(args)
+        tool_calls.append(
+            {
+                "id": f"call_{uuid.uuid4().hex[:24]}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": args_str,
+                },
+            }
+        )
+
+    remaining_text = _TOOL_CALL_RE.sub("", text).strip()
+    return (tool_calls or None), remaining_text
 
 
 class LLMEngine:
@@ -179,13 +230,14 @@ class LLMEngine:
             self._last_used = time.monotonic()
             self._semaphore.release()
 
-    def _build_inputs(self, messages: List[dict]) -> dict:
+    def _build_inputs(self, messages: List[dict], tools: Optional[List[dict]] = None) -> dict:
         # return_dict=True is explicit on purpose: apply_chat_template's return
         # type (bare tensor vs BatchEncoding) has varied across transformers
         # versions, which previously caused generate() to choke on a
         # BatchEncoding passed where it expected a plain tensor.
         encoded = self.tokenizer.apply_chat_template(
             messages,
+            tools=tools,
             tokenize=True,
             add_generation_prompt=True,
             return_tensors="pt",
@@ -218,14 +270,15 @@ class LLMEngine:
         temperature: float,
         top_p: float,
         stop: Optional[List[str]] = None,
+        tools: Optional[List[dict]] = None,
     ) -> dict:
         async with self._slot():
             return await asyncio.to_thread(
-                self._generate_sync, messages, max_new_tokens, temperature, top_p, stop
+                self._generate_sync, messages, max_new_tokens, temperature, top_p, stop, tools
             )
 
-    def _generate_sync(self, messages, max_new_tokens, temperature, top_p, stop) -> dict:
-        inputs = self._build_inputs(messages)
+    def _generate_sync(self, messages, max_new_tokens, temperature, top_p, stop, tools=None) -> dict:
+        inputs = self._build_inputs(messages, tools)
         prompt_len = inputs["input_ids"].shape[-1]
         gen_kwargs = self._gen_kwargs(inputs, max_new_tokens, temperature, top_p, stop)
         try:
@@ -239,9 +292,11 @@ class LLMEngine:
             )
         new_tokens = output_ids[0][prompt_len:]
         text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
-        finish_reason = "length" if len(new_tokens) >= max_new_tokens else "stop"
+        tool_calls, clean_text = _parse_tool_calls(text) if tools else (None, text)
+        finish_reason = "tool_calls" if tool_calls else ("length" if len(new_tokens) >= max_new_tokens else "stop")
         return {
-            "text": text,
+            "text": clean_text,
+            "tool_calls": tool_calls,
             "prompt_tokens": prompt_len,
             "completion_tokens": len(new_tokens),
             "finish_reason": finish_reason,
@@ -254,7 +309,20 @@ class LLMEngine:
         temperature: float,
         top_p: float,
         stop: Optional[List[str]] = None,
-    ) -> AsyncGenerator[str, None]:
+        tools: Optional[List[dict]] = None,
+    ) -> AsyncGenerator[dict, None]:
+        if tools:
+            # Tool calls aren't token-streamed: the whole <tool_call> block
+            # needs to be complete before it can be parsed into structured
+            # tool_calls, so this buffers the full generation (via generate(),
+            # which handles its own slot/queueing) and yields it as one chunk.
+            result = await self.generate(messages, max_new_tokens, temperature, top_p, stop, tools)
+            if result["tool_calls"]:
+                yield {"tool_calls": result["tool_calls"]}
+            elif result["text"]:
+                yield {"content": result["text"]}
+            return
+
         async with self._slot():
             inputs = self._build_inputs(messages)
             # timeout=... lets the consumer loop notice a dead generation
@@ -279,7 +347,7 @@ class LLMEngine:
                     if not thread.is_alive():
                         break
                     continue
-                yield chunk
+                yield {"content": chunk}
 
             await loop.run_in_executor(None, thread.join)
             if errors:

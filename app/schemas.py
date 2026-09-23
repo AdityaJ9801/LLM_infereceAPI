@@ -1,13 +1,38 @@
 import time
 import uuid
-from typing import List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field
 
 
+class FunctionDef(BaseModel):
+    name: str
+    description: Optional[str] = None
+    parameters: Optional[Dict[str, Any]] = None
+
+
+class ToolDef(BaseModel):
+    type: Literal["function"] = "function"
+    function: FunctionDef
+
+
+class ToolCallFunction(BaseModel):
+    name: str
+    arguments: str  # JSON-encoded, per the OpenAI convention
+
+
+class ToolCall(BaseModel):
+    id: str
+    type: Literal["function"] = "function"
+    function: ToolCallFunction
+
+
 class ChatMessage(BaseModel):
-    role: Literal["system", "user", "assistant"]
-    content: str
+    role: Literal["system", "user", "assistant", "tool"]
+    content: Optional[str] = None
+    tool_calls: Optional[List[ToolCall]] = None
+    # Set on role="tool" messages, echoing which call this is a result for.
+    tool_call_id: Optional[str] = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -20,6 +45,10 @@ class ChatCompletionRequest(BaseModel):
     stop: Optional[Union[str, List[str]]] = None
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
+    tools: Optional[List[ToolDef]] = None
+    # Accepted for API compatibility but NOT enforced - the model decides
+    # whether to call a tool on its own. See README's tool-calling section.
+    tool_choice: Optional[Union[str, Dict[str, Any]]] = None
 
 
 class Usage(BaseModel):
@@ -46,6 +75,7 @@ class ChatCompletionResponse(BaseModel):
 class DeltaMessage(BaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
+    tool_calls: Optional[List[ToolCall]] = None
 
 
 class ChatCompletionStreamChoice(BaseModel):
