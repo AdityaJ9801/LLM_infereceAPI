@@ -347,3 +347,75 @@ unit for the Python app would make both persist across reboots.)
   runs `MAX_CONCURRENT_REQUESTS` generations at once; beyond `MAX_QUEUE_SIZE`
   queued on top of that, requests get HTTP 503 (see "Concurrency, queueing,
   and idle VRAM release" above).
+
+### Sample code
+**API Key:**
+```
+64a481086000eb9a92f0ce47af1fbafc69251a9a721b645638d13b84f9ff196d
+```
+
+**Public URL:**
+```
+https://llm.smigan.com
+```
+
+**curl:**
+```bash
+curl https://llm.smigan.com/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer 64a481086000eb9a92f0ce47af1fbafc69251a9a721b645638d13b84f9ff196d" \
+  -d '{"messages":[{"role":"user","content":"What is 17 * 24? Show your reasoning."}]}'
+```
+
+**Python (using the official `openai` SDK — the API is OpenAI-compatible, so you just point it at your own server):**
+
+```python
+# pip install openai
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://llm.smigan.com/v1",
+    api_key="64a481086000eb9a92f0ce47af1fbafc69251a9a721b645638d13b84f9ff196d",
+)
+
+response = client.chat.completions.create(
+    model="Qwen/Qwen3-14B",  # ignored by the server, but the SDK requires the field
+    messages=[{"role": "user", "content": "What is 17 * 24? Show your reasoning."}],
+    temperature=0.7,
+    max_tokens=512,
+)
+print(response.choices[0].message.content)
+```
+
+**Python streaming (same SDK, `stream=True`):**
+
+```python
+stream = client.chat.completions.create(
+    model="Qwen/Qwen3-14B",
+    messages=[{"role": "user", "content": "Count from 1 to 10."}],
+    stream=True,
+)
+for chunk in stream:
+    delta = chunk.choices[0].delta.content
+    if delta:
+        print(delta, end="", flush=True)
+print()
+```
+
+**Plain Python (no extra dependency, using `requests` — same as this repo's `test_client.py`):**
+
+```python
+import requests
+
+resp = requests.post(
+    "https://llm.smigan.com/v1/chat/completions",
+    headers={
+        "Content-Type": "application/json",
+        "Authorization": "Bearer 64a481086000eb9a92f0ce47af1fbafc69251a9a721b645638d13b84f9ff196d",
+    },
+    json={"messages": [{"role": "user", "content": "What is 17 * 24?"}]},
+)
+print(resp.json()["choices"][0]["message"]["content"])
+```
+
+Note: with `ENABLE_THINKING=true` (the default), replies may include a `<think>...</think>` reasoning block before the final answer — strip it client-side if you only want the final answer. Also, since this key is now visible in plain text in this chat and your shell history, treat the tunnel as effectively public to anyone who gets hold of it — rotate the key (`sed -i "s/^API_KEY=.*/API_KEY=$(openssl rand -hex 32)/" ~/LLM_infereceAPI/.env` + restart the server) if you ever want to invalidate this one.
