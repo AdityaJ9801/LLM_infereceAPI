@@ -334,6 +334,7 @@ unit for the Python app would make both persist across reboots.)
 | Public curl hangs / `~/cloudflared.log` shows repeated QUIC errors, no `Registered tunnel connection` | Outbound UDP blocked/unreliable | Restart the connector with `--protocol http2` |
 | Public URL returns "Invalid or missing API key" even with the right key | `.env`'s `API_KEY` changed after the server last started | Restart the API server — env vars are read once at startup, not hot-reloaded |
 | `curl` right after a restart returns nothing / 502 briefly | Model is still loading (lifespan startup isn't done) | Wait for `Application startup complete` in `server.log` before testing |
+| Cloudflare error 524 ("A Timeout Occurred") | Non-streaming generation took longer than Cloudflare's ~100s proxy timeout (Free/Pro plans, not configurable there) - plausible with `attn_implementation=eager` and a large `max_tokens` | Use `"stream": true` (sends data continuously, avoids the timeout) instead of relying on the fix being on Cloudflare's end; lower `max_tokens` for any non-streaming calls |
 
 ### Harden it before leaving it running
 
@@ -349,9 +350,13 @@ unit for the Python app would make both persist across reboots.)
   and idle VRAM release" above).
 
 ### Sample code
-**API Key:**
-```
-64a481086000eb9a92f0ce47af1fbafc69251a9a721b645638d13b84f9ff196d
+```bash
+pkill -f "app.main"
+sleep 2
+cd ~/LLM_infereceAPI
+nohup python3 -m app.main > server.log 2>&1 &
+disown
+tail -f server.log   # wait for "Application startup complete" — don't Ctrl+C early this time
 ```
 
 **Public URL:**
