@@ -98,7 +98,7 @@ app/
 test_client.py # quick manual smoke test
 Dockerfile, docker-compose.yml   # Docker path
 requirements.txt                 # native pip path
-cloudflared/config.yml.example    # named-tunnel template
+cloudflared/config.yml.example    # template for the alternative CLI-managed tunnel (see below) - not needed for the dashboard/token flow this README uses by default
 ```
 
 ## 1. Configure
@@ -199,66 +199,68 @@ chmod +x ~/cloudflared
 
 (If you have sudo and prefer a system package: `curl -L --output cloudflared.deb .../cloudflared-linux-amd64.deb && sudo dpkg -i cloudflared.deb` — use the `.rpm` on RHEL/CentOS/Fedora. Then just drop the `~/` prefix from the commands below.)
 
-### Fastest path — quick tunnel (no domain required, good for testing)
+### Quickest path — quick tunnel (no domain required, good for a one-off test)
 
 ```bash
-~/cloudflared tunnel --url http://localhost:8000
+~/cloudflared tunnel --url http://localhost:8000   # match your .env's PORT
 ```
 
 This prints a temporary `https://<random>.trycloudflare.com` URL that proxies
 straight to your local server. It changes every time you restart the command —
-fine for testing, not for a stable public endpoint.
+fine for a quick test, not for a stable public endpoint.
 
-### Stable path — named tunnel with your own domain
+### Stable path — dashboard-managed tunnel with a token (what this deployment actually uses)
 
-Requires a domain added to your Cloudflare account (Cloudflare DNS must be
-authoritative for it). Replace `yourdomain.com` and the `llm` subdomain below
-with your real values.
+This is a "remotely-managed" tunnel: the hostname/routing config lives in
+Cloudflare's dashboard, not a local file, and the token is what authorizes
+`cloudflared` to connect as that tunnel's connector.
 
-```bash
-cd ~/LLM_infereceAPI
+**1. Create the tunnel** at [one.dash.cloudflare.com](https://one.dash.cloudflare.com) →
+**Networks → Tunnels → Create a tunnel** → connector type **Cloudflared** →
+name it (e.g. `llm-api`) → **Save tunnel**.
 
-# 1. Authenticate - prints a URL, open it in a LOCAL browser (server is headless),
-#    log in, and pick the domain to authorize. Writes ~/.cloudflared/cert.pem.
-~/cloudflared tunnel login
+**2. Get the token.** The next screen shows OS-specific install commands, each
+containing a long token. Pick the **Debian** tab (closest match for a Linux
+GPU container) and copy just the token value — the long string after
+`service install` in `sudo cloudflared service install <TOKEN>`. You don't
+need sudo/systemd to use it; ignore that exact command.
 
-# 2. Create the tunnel - prints a TUNNEL_ID and writes
-#    ~/.cloudflared/<TUNNEL_ID>.json (credentials for this tunnel)
-~/cloudflared tunnel create llm-api
-
-# 3. Write the config, filling in the TUNNEL_ID from step 2
-TUNNEL_ID=<paste-the-id-from-step-2>
-DOMAIN=yourdomain.com
-SUBDOMAIN=llm
-
-mkdir -p cloudflared
-cat > cloudflared/config.yml <<EOF
-tunnel: ${TUNNEL_ID}
-credentials-file: ${HOME}/.cloudflared/${TUNNEL_ID}.json
-ingress:
-  - hostname: ${SUBDOMAIN}.${DOMAIN}
-    service: http://localhost:8000
-  - service: http_status:404
-EOF
-
-# 4. Point the DNS record at the tunnel (creates a CNAME in your Cloudflare zone)
-~/cloudflared tunnel route dns llm-api ${SUBDOMAIN}.${DOMAIN}
-
-# 5. Run it (foreground, to confirm it connects cleanly)
-~/cloudflared tunnel --config cloudflared/config.yml run llm-api
-```
-
-Once step 5 shows `Registered tunnel connection`, `Ctrl+C` it and run it in the
-background instead so it survives your SSH session ending:
+**3. Run the connector with the token:**
 
 ```bash
-nohup ~/cloudflared tunnel --config ~/LLM_infereceAPI/cloudflared/config.yml run llm-api \
-  > ~/cloudflared.log 2>&1 &
+nohup ~/cloudflared tunnel run --token <TOKEN> > ~/cloudflared.log 2>&1 &
 disown
-sleep 3 && tail -n 20 ~/cloudflared.log
+sleep 5 && tail -n 20 ~/cloudflared.log
 ```
 
-Test it:
+Look for `Registered tunnel connection` lines — that confirms it's actually
+connected to Cloudflare's edge (the dashboard's tunnel status also flips to
+"Healthy"). If instead you see repeated QUIC connection errors/retries with
+no successful registration, outbound UDP is likely blocked/unreliable on
+this network — restart with HTTP/2 (plain TCP/443) instead:
+
+```bash
+pkill -f "cloudflared tunnel run"
+nohup ~/cloudflared tunnel run --protocol http2 --token <TOKEN> > ~/cloudflared.log 2>&1 &
+disown
+```
+
+**4. Add the public hostname** — back in the dashboard, on the tunnel's
+**Public Hostname** tab → **Add a public hostname**:
+
+- **Subdomain**: e.g. `llm`
+- **Domain**: pick yours from the dropdown
+- **Type**: **`HTTP`** — not `HTTPS`. This app serves plain HTTP; setting
+  `HTTPS` here makes cloudflared try to TLS-handshake against a plain HTTP
+  port, which fails every request with `tls: first record does not look
+  like a TLS handshake` (visible in `~/cloudflared.log`) and a 502 to the
+  client.
+- **URL**: `localhost:<PORT>` — must exactly match `PORT` in your `.env`
+  (default `8000`). If you ever change `PORT`, update this field too, or
+  you'll get a 502 even though your server is healthy locally.
+- **Save**.
+
+**5. Test:**
 
 ```bash
 curl https://llm.yourdomain.com/health
@@ -268,13 +270,70 @@ curl https://llm.yourdomain.com/v1/chat/completions \
   -d '{"messages":[{"role":"user","content":"Hello!"}]}'
 ```
 
-If your server has `systemd` and you have sudo, you can install it as a proper
-service instead of `nohup`:
+### Updating or rotating the tunnel token
+
+The token only lives in the `cloudflared tunnel run --token <TOKEN>` command
+you started — it's never stored in this repo (and shouldn't be committed
+anywhere). To get it again, or a fresh one:
+
+- **Reuse the existing token** (e.g. restarting after a reboot): dashboard →
+  **Networks → Tunnels → llm-api** → open the connector install instructions
+  again (same place as step 2 above) — it shows the same token. Copy it and
+  reuse it in the `tunnel run --token` command.
+- **Rotate to a new token** (e.g. the old one may have leaked): in the
+  tunnel's connector settings, use **Refresh token** — this invalidates the
+  old one immediately, so any currently-running `cloudflared tunnel run`
+  process using it will disconnect.
+- Either way, apply it by restarting the connector:
 
 ```bash
-sudo ~/cloudflared service install --config /full/path/to/cloudflared/config.yml
-sudo systemctl enable --now cloudflared
+pkill -f "cloudflared tunnel run"
+sleep 1
+nohup ~/cloudflared tunnel run --token <TOKEN> > ~/cloudflared.log 2>&1 &
+disown
+sleep 5 && tail -n 20 ~/cloudflared.log
 ```
+
+Treat the token like a credential (anyone holding it can run a connector that
+receives traffic meant for your tunnel) — don't paste it into the repo, a
+commit, or anywhere public.
+
+### Keeping both processes running in the background
+
+Two long-running processes need to survive your SSH session ending: the API
+server and the tunnel connector. Same `nohup ... & disown` pattern for both:
+
+```bash
+# API server
+cd ~/LLM_infereceAPI
+nohup python3 -m app.main > server.log 2>&1 &
+disown
+
+# Tunnel connector
+nohup ~/cloudflared tunnel run --token <TOKEN> > ~/cloudflared.log 2>&1 &
+disown
+```
+
+Check both are alive at any time:
+
+```bash
+ps aux | grep -E "app.main|cloudflared" | grep -v grep
+```
+
+Neither currently survives a server reboot/container restart on its own —
+after one, re-run both `nohup` commands above manually. (With sudo/systemd
+access, `sudo ~/cloudflared service install --token <TOKEN>` plus a systemd
+unit for the Python app would make both persist across reboots.)
+
+### Troubleshooting quick reference
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Cloudflare error 1033 | `cloudflared tunnel run` isn't running | `ps aux \| grep cloudflared`; restart it with the token command above |
+| Cloudflare error 502, but `curl http://localhost:<PORT>/health` works locally | Public Hostname **Type** is `HTTPS` instead of `HTTP`, or the **URL** port doesn't match your app's `PORT` | Fix both fields on the dashboard's Public Hostname tab |
+| Public curl hangs / `~/cloudflared.log` shows repeated QUIC errors, no `Registered tunnel connection` | Outbound UDP blocked/unreliable | Restart the connector with `--protocol http2` |
+| Public URL returns "Invalid or missing API key" even with the right key | `.env`'s `API_KEY` changed after the server last started | Restart the API server — env vars are read once at startup, not hot-reloaded |
+| `curl` right after a restart returns nothing / 502 briefly | Model is still loading (lifespan startup isn't done) | Wait for `Application startup complete` in `server.log` before testing |
 
 ### Harden it before leaving it running
 
