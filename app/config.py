@@ -14,9 +14,11 @@ def _opt(name: str) -> Optional[str]:
 
 @dataclass
 class Settings:
-    # Real Hugging Face repo IDs only. Default fits comfortably in ~45GB VRAM
-    # at plain bf16 (no quantization) - see README for the 32B+4bit upgrade path.
-    model_name: str = os.getenv("MODEL_NAME", "Qwen/Qwen3-14B")
+    # Real Hugging Face repo IDs only. Default (~16GB bf16 weights) leaves
+    # ~29GB free on a 45GB card - Qwen3-14B's ~17GB free was too tight once
+    # combined with eager attention's prefill overhead and tool-schema-laden
+    # prompts, causing real-world OOMs. See README for the 32B+4bit upgrade path.
+    model_name: str = os.getenv("MODEL_NAME", "Qwen/Qwen3-8B")
     tokenizer_name: Optional[str] = _opt("TOKENIZER_NAME")
     trust_remote_code: bool = os.getenv("TRUST_REMOTE_CODE", "true").lower() == "true"
     # Qwen3's chat template has a built-in reasoning ("thinking") mode; harmless

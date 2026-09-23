@@ -27,24 +27,25 @@ Everything is configurable via `.env` if your actual box differs.
 
 - **There is no model called `gemma4:26b`.** That `name:size` format is Ollama's
   tagging convention; `transformers`/HF load models by their Hugging Face repo
-  ID instead (e.g. `Qwen/Qwen3-14B`). Set whichever real model you want in `MODEL_NAME`.
+  ID instead (e.g. `Qwen/Qwen3-8B`). Set whichever real model you want in `MODEL_NAME`.
 - **B200 is very new hardware (Blackwell, compute capability `sm_100`).** It
   needs a recent NVIDIA driver (CUDA 12.6+/12.8 support) and a `torch` build
   compiled for a CUDA version your driver actually supports. Don't rely on
   plain `pip install torch` resolving the right one automatically — pin it
   explicitly (see install steps below) and run the sanity check first.
 - **A 32B model at full bf16 needs ~64GB just for weights** — it won't fit in
-  45GB. The default model here (`Qwen/Qwen3-14B`) fits comfortably at plain
-  bf16 with no quantization. To run something 32B-class instead, set
+  45GB. The default model here (`Qwen/Qwen3-8B`) leaves generous headroom at
+  plain bf16 with no quantization. To run something 32B-class instead, set
   `LOAD_IN_4BIT=true` (uses `bitsandbytes`) — see the table below.
 
 ## Choosing a model for ~45GB VRAM
 
 | Setup | `MODEL_NAME` | `LOAD_IN_4BIT` | Notes |
 |---|---|---|---|
-| **Default (recommended first try)** | `Qwen/Qwen3-14B` | `false` | ~28GB weights at bf16, comfortable headroom, zero quantization risk on brand-new hardware. |
-| More reasoning power, if you want to push it | `Qwen/Qwen3-32B` | `true` | 4-bit via `bitsandbytes`, weights ~18-20GB. `bitsandbytes` kernels can also lag on very new GPUs — if it errors, fall back to the row above. |
-| Alternative reasoning-specialist | `deepseek-ai/DeepSeek-R1-Distill-Qwen-14B` | `false` | Distilled directly from DeepSeek-R1's reasoning traces, similar size class to the default. |
+| **Default (recommended first try)** | `Qwen/Qwen3-8B` | `false` | ~16GB weights at bf16, ~29GB free for KV cache/eager-attention overhead. Strong reasoning/coding, same Hermes-style tool-calling format as the rest of Qwen3. |
+| More headroom margin without dropping model family/tool format | `Qwen/Qwen3-14B` | `false` | ~28GB weights, ~17GB free - workable, but combined with `eager` attention and tool-schema-laden prompts this proved too tight in production here (real OOMs under real agent traffic). Prefer the 8B row unless you've confirmed enough headroom for your actual payloads. |
+| More reasoning power, if you want to push it | `Qwen/Qwen3-32B` | `true` | 4-bit via `bitsandbytes`, weights ~18-20GB. `bitsandbytes` kernels can also lag on very new GPUs — if it errors, fall back to a row above. |
+| Alternative reasoning-specialist | `deepseek-ai/DeepSeek-R1-Distill-Qwen-14B` | `false` | Distilled directly from DeepSeek-R1's reasoning traces. Different chat template family - its tool-calling format (if any) hasn't been verified here, unlike the Qwen3 rows. |
 
 ## Sanity-check your GPU stack first
 
@@ -68,9 +69,10 @@ Three `.env` settings control how the server shares the GPU:
 - **`MAX_CONCURRENT_REQUESTS`** (default `2`) — how many `generate()` calls run
   on the GPU at once. Each one holds its own KV cache in VRAM for the
   duration of that request, on top of the model weights, so raise this only
-  as far as your free VRAM allows. With the default `Qwen/Qwen3-14B` at bf16
-  (~28GB weights, ~17GB free on a 45GB card), 2 is a conservative starting
-  point — watch `nvidia-smi` under load before raising it.
+  as far as your free VRAM allows. With the default `Qwen/Qwen3-8B` at bf16
+  (~16GB weights, ~29GB free on a 45GB card), 2 is a conservative starting
+  point — watch `nvidia-smi` under load with a realistic payload (see
+  "Finding the highest safe `MAX_CONCURRENT_REQUESTS`" below) before raising it.
 - **`MAX_QUEUE_SIZE`** (default `20`) — requests beyond the concurrency limit
   wait here. Once the queue itself is full, new requests get an immediate
   HTTP 503 instead of queueing indefinitely.
@@ -252,11 +254,12 @@ history) in your next request to continue the conversation.
   buffers the whole generation server-side and delivers it as a single SSE
   chunk instead of incremental deltas. Plain text responses still stream
   normally, token by token.
-- **The parsing format is specific to `Qwen/Qwen3-14B`'s chat template**
+- **The parsing format is verified for `Qwen/Qwen3-8B` and `Qwen/Qwen3-14B`**
   (Hermes-style `<tool_call>{"name":...,"arguments":{...}}</tool_call>`,
-  verified against its actual `tokenizer_config.json`). Some other Qwen3.x
-  models (e.g. Qwen3.5) use a different XML `<function=name>` format instead
-  - if you change `MODEL_NAME` to one of those, `_parse_tool_calls` in
+  checked directly against both models' actual `tokenizer_config.json`).
+  Some other Qwen3.x models (e.g. Qwen3.5) use a different XML
+  `<function=name>` format instead - if you change `MODEL_NAME` to one of
+  those (or a different model family entirely), `_parse_tool_calls` in
   `app/engine.py` needs updating to match, or tool calls will silently show
   up as plain text instead of structured `tool_calls`.
 
@@ -431,35 +434,17 @@ unit for the Python app would make both persist across reboots.)
   queued on top of that, requests get HTTP 503 (see "Concurrency, queueing,
   and idle VRAM release" above).
 
-### Sample code
-```bash
-pkill -f "app.main"
-sleep 2
-cd ~/LLM_infereceAPI
-nohup python3 -m app.main > server.log 2>&1 &
-disown
-tail -f server.log   # wait for "Application startup complete" — don't Ctrl+C early this time
-```What's the new model name (exactly as your endpoint expects it in the 'model` field)?
+### Sample client code
 
-Same endpoint, different model
-Still https://llm.smigan.com/v1, just swap LLM_MODEL_NAME to a new value you'll give me.
-
-Different endpoint entirely
-New base URL and/or API key too, not just the model name.
-
-Other
-
-
-**Public URL:**
-```
-https://llm.smigan.com
-```
+Replace `<PUBLIC_URL>` and `<API_KEY>` with your own tunnel hostname and the
+`API_KEY` from your server's `.env` — **never commit real values here**, this
+repo is public.
 
 **curl:**
 ```bash
-curl https://llm.smigan.com/v1/chat/completions \
+curl <PUBLIC_URL>/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer 64a481086000eb9a92f0ce47af1fbafc69251a9a721b645638d13b84f9ff196d" \
+  -H "Authorization: Bearer <API_KEY>" \
   -d '{"messages":[{"role":"user","content":"What is 17 * 24? Show your reasoning."}]}'
 ```
 
@@ -470,12 +455,12 @@ curl https://llm.smigan.com/v1/chat/completions \
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="https://llm.smigan.com/v1",
-    api_key="64a481086000eb9a92f0ce47af1fbafc69251a9a721b645638d13b84f9ff196d",
+    base_url="<PUBLIC_URL>/v1",
+    api_key="<API_KEY>",
 )
 
 response = client.chat.completions.create(
-    model="Qwen/Qwen3-14B",  # ignored by the server, but the SDK requires the field
+    model="Qwen/Qwen3-8B",  # ignored by the server, but the SDK requires the field
     messages=[{"role": "user", "content": "What is 17 * 24? Show your reasoning."}],
     temperature=0.7,
     max_tokens=512,
@@ -487,7 +472,7 @@ print(response.choices[0].message.content)
 
 ```python
 stream = client.chat.completions.create(
-    model="Qwen/Qwen3-14B",
+    model="Qwen/Qwen3-8B",
     messages=[{"role": "user", "content": "Count from 1 to 10."}],
     stream=True,
 )
@@ -504,14 +489,16 @@ print()
 import requests
 
 resp = requests.post(
-    "https://llm.smigan.com/v1/chat/completions",
+    "<PUBLIC_URL>/v1/chat/completions",
     headers={
         "Content-Type": "application/json",
-        "Authorization": "Bearer 64a481086000eb9a92f0ce47af1fbafc69251a9a721b645638d13b84f9ff196d",
+        "Authorization": "Bearer <API_KEY>",
     },
     json={"messages": [{"role": "user", "content": "What is 17 * 24?"}]},
 )
 print(resp.json()["choices"][0]["message"]["content"])
 ```
 
-Note: with `ENABLE_THINKING=true` (the default), replies may include a `<think>...</think>` reasoning block before the final answer — strip it client-side if you only want the final answer. Also, since this key is now visible in plain text in this chat and your shell history, treat the tunnel as effectively public to anyone who gets hold of it — rotate the key (`sed -i "s/^API_KEY=.*/API_KEY=$(openssl rand -hex 32)/" ~/LLM_infereceAPI/.env` + restart the server) if you ever want to invalidate this one.
+Note: with `ENABLE_THINKING=true` (the default), replies may include a
+`<think>...</think>` reasoning block before the final answer — strip it
+client-side if you only want the final answer.
