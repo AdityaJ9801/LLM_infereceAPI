@@ -5,6 +5,30 @@ from typing import Any, Dict, List, Literal, Optional, Union
 from pydantic import BaseModel, Field
 
 
+# ---------------------------------------------------------------------------
+# Multimodal content parts  (OpenAI vision-API compatible)
+# ---------------------------------------------------------------------------
+
+
+class ImageUrlDetail(BaseModel):
+    url: str  # https://… URL  OR  data:image/<type>;base64,<b64>
+    detail: Optional[Literal["auto", "low", "high"]] = "auto"
+
+
+class ContentPartText(BaseModel):
+    type: Literal["text"]
+    text: str
+
+
+class ContentPartImage(BaseModel):
+    type: Literal["image_url"]
+    image_url: ImageUrlDetail
+
+
+# A single element of a multipart content list.
+ContentPart = Union[ContentPartText, ContentPartImage]
+
+
 class FunctionDef(BaseModel):
     name: str
     description: Optional[str] = None
@@ -29,7 +53,11 @@ class ToolCall(BaseModel):
 
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant", "tool"]
-    content: Optional[str] = None
+    # content can be:
+    #   • a plain string  (text-only, backward-compatible)
+    #   • a list of ContentPart objects  (multimodal: text + image_url)
+    #   • None  (tool-call-only assistant turns)
+    content: Optional[Union[str, List[ContentPart]]] = None
     tool_calls: Optional[List[ToolCall]] = None
     # Set on role="tool" messages, echoing which call this is a result for.
     tool_call_id: Optional[str] = None

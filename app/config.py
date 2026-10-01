@@ -24,6 +24,9 @@ class Settings:
     # Qwen3's chat template has a built-in reasoning ("thinking") mode; harmless
     # extra kwarg for chat templates that don't reference it.
     enable_thinking: bool = os.getenv("ENABLE_THINKING", "true").lower() == "true"
+    # Set to true when running a vision-language model (e.g. Qwen2-VL, LLaVA).
+    # Loads AutoProcessor and handles image encoding in _build_inputs().
+    is_vision_model: bool = os.getenv("IS_VISION_MODEL", "false").lower() == "true"
 
     # "bfloat16", "float16", or "auto" (use the checkpoint's declared dtype).
     torch_dtype: str = os.getenv("TORCH_DTYPE", "bfloat16")

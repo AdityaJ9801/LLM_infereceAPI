@@ -1,5 +1,7 @@
 import asyncio
+import base64
 import gc
+import io
 import json
 import logging
 import os
@@ -11,6 +13,9 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
+import requests
+from PIL import Image
+
 # Must be set before `import torch`. On unprivileged containers attached to an
 # NVIDIA MIG slice, NVML device-level queries return NVML_ERROR_NO_PERMISSION,
 # which otherwise crashes torch's CUDA caching allocator with a hard assert
@@ -20,7 +25,7 @@ from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 os.environ.setdefault("PYTORCH_NO_CUDA_NVML", "1")
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
+from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer, TextIteratorStreamer
 
 from app.config import settings
 
@@ -136,6 +141,8 @@ class LLMEngine:
     def __init__(self) -> None:
         self.model = None
         self.tokenizer = None
+        # For vision-language models: full processor (tokenizer + image processor).
+        self.processor = None
         self._load_lock = asyncio.Lock()
         self._semaphore = asyncio.Semaphore(settings.max_concurrent_requests)
         self._active = 0
@@ -144,10 +151,22 @@ class LLMEngine:
         self._idle_task: Optional[asyncio.Task] = None
 
     async def startup(self) -> None:
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            settings.tokenizer_name or settings.model_name,
-            trust_remote_code=settings.trust_remote_code,
-        )
+        pretrained_name = settings.tokenizer_name or settings.model_name
+        if settings.is_vision_model:
+            # AutoProcessor wraps both the tokenizer and the image processor;
+            # for vision models it replaces the bare AutoTokenizer.
+            self.processor = await asyncio.to_thread(
+                AutoProcessor.from_pretrained,
+                pretrained_name,
+                trust_remote_code=settings.trust_remote_code,
+            )
+            self.tokenizer = self.processor.tokenizer
+        else:
+            self.tokenizer = await asyncio.to_thread(
+                AutoTokenizer.from_pretrained,
+                pretrained_name,
+                trust_remote_code=settings.trust_remote_code,
+            )
         await self._load_model()
         if settings.idle_unload_seconds > 0:
             self._idle_task = asyncio.create_task(self._idle_watcher())
@@ -215,6 +234,54 @@ class LLMEngine:
             gc.collect()
             torch.cuda.empty_cache()
 
+    # ------------------------------------------------------------------
+    # Image helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _load_image(url: str) -> Image.Image:
+        """Fetch an image from an https:// URL or a data:image/…;base64,… URI."""
+        if url.startswith("data:"):
+            # data:image/<type>;base64,<payload>
+            header, encoded = url.split(",", 1)
+            image_bytes = base64.b64decode(encoded)
+            return Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        # Remote URL – use a short timeout to avoid blocking the event loop
+        # for too long (actual download is run in a thread via to_thread).
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        return Image.open(io.BytesIO(resp.content)).convert("RGB")
+
+    @staticmethod
+    def _prepare_messages(messages: List[dict]) -> Tuple[List[dict], List[Image.Image]]:
+        """Convert OpenAI-style multipart content lists to the format expected
+        by Qwen-VL / apply_chat_template while collecting PIL images in order.
+
+        Text-only messages (content is a str or None) are returned unchanged.
+        Returns (transformed_messages, images_in_order).
+        """
+        all_images: List[Image.Image] = []
+        transformed: List[dict] = []
+        for msg in messages:
+            content = msg.get("content")
+            if not isinstance(content, list):
+                transformed.append(msg)
+                continue
+
+            # Multipart: build a new content list with <image> placeholders
+            # that Qwen-VL's chat template understands.
+            new_parts = []
+            for part in content:
+                if part.get("type") == "text":
+                    new_parts.append({"type": "text", "text": part["text"]})
+                elif part.get("type") == "image_url":
+                    img_url = part.get("image_url", {}).get("url", "")
+                    image = LLMEngine._load_image(img_url)
+                    all_images.append(image)
+                    new_parts.append({"type": "image"})
+            transformed.append({**msg, "content": new_parts})
+        return transformed, all_images
+
     async def _idle_watcher(self) -> None:
         while True:
             await asyncio.sleep(settings.idle_check_interval_seconds)
@@ -251,15 +318,34 @@ class LLMEngine:
         # type (bare tensor vs BatchEncoding) has varied across transformers
         # versions, which previously caused generate() to choke on a
         # BatchEncoding passed where it expected a plain tensor.
-        encoded = self.tokenizer.apply_chat_template(
-            messages,
-            tools=tools,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_tensors="pt",
-            return_dict=True,
-            enable_thinking=settings.enable_thinking,
-        )
+        if settings.is_vision_model:
+            # For VLMs (e.g. Qwen2-VL) the processor combines chat-template
+            # application + image pre-processing in one call.  Images must have
+            # already been extracted by _prepare_messages().
+            prepared_msgs, images = self._prepare_messages(messages)
+            # Pass images=None when there are none to avoid the processor
+            # complaining about an empty list.
+            proc_kwargs: Dict[str, Any] = dict(
+                text=self.processor.apply_chat_template(
+                    prepared_msgs,
+                    tools=tools,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                ),
+                images=images if images else None,
+                return_tensors="pt",
+            )
+            encoded = self.processor(**proc_kwargs)
+        else:
+            encoded = self.tokenizer.apply_chat_template(
+                messages,
+                tools=tools,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_tensors="pt",
+                return_dict=True,
+                enable_thinking=settings.enable_thinking,
+            )
         return {k: v.to(self.model.device) for k, v in encoded.items()}
 
     def _gen_kwargs(self, inputs: dict, max_new_tokens: int, temperature: float, top_p: float, stop: Optional[List[str]]):
