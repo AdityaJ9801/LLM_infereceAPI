@@ -25,7 +25,13 @@ from PIL import Image
 os.environ.setdefault("PYTORCH_NO_CUDA_NVML", "1")
 
 import torch
-from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer, TextIteratorStreamer
+from transformers import (
+    AutoModelForCausalLM,
+    AutoModelForImageTextToText,
+    AutoProcessor,
+    AutoTokenizer,
+    TextIteratorStreamer,
+)
 
 from app.config import settings
 
@@ -215,8 +221,13 @@ class LLMEngine:
             )
             model_kwargs.pop("dtype", None)
 
+        # AutoModelForImageTextToText auto-detects the right architecture class
+        # from the checkpoint's config (Qwen2-VL, Qwen2.5-VL, LLaVA, etc.) -
+        # using AutoModelForCausalLM for a vision-language model's config
+        # fails with "Unrecognized configuration class".
+        model_cls = AutoModelForImageTextToText if settings.is_vision_model else AutoModelForCausalLM
         model = await asyncio.to_thread(
-            AutoModelForCausalLM.from_pretrained, settings.model_name, **model_kwargs
+            model_cls.from_pretrained, settings.model_name, **model_kwargs
         )
         model.eval()
         self.model = model
